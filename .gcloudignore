@@ -13,7 +13,25 @@
 .git
 .gitignore
 
-# Python pycache:
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache files
 __pycache__/
-# Ignored by the build system
-/setup.cfg
+*.pyc
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# IDE files
+.vscode/
+.idea/
+
+# Other common directories to ignore
+node_modules/
+*.log
+.env

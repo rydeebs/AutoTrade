@@ -1,101 +1,113 @@
+import requests
 import alpaca_trade_api as tradeapi
 import pandas as pd
 import numpy as np
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import time as time_module
 import imaplib
 import email
 from email.header import decode_header
-import json
 import logging
-import csv
 import pytz
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, GMAIL_USER, GMAIL_PASSWORD
+import re
+import traceback
+import json
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ZeroDTEStrategy:
     def __init__(self, alpaca_key, alpaca_secret, gmail_user, gmail_password):
-        # Use live trading endpoint
-        self.alpaca_api = tradeapi.REST(alpaca_key, alpaca_secret, base_url='https://api.alpaca.markets', api_version='v2')
-        self.symbols = ['SPY', 'QQQ']
+        # Regular API for trading
+        self.alpaca_api = tradeapi.REST(
+            alpaca_key, 
+            alpaca_secret, 
+            base_url='https://api.alpaca.markets',  # Live trading URL
+            api_version='v2'
+        )
+
+        # Options API for market data
+        self.options_api = tradeapi.REST(
+            alpaca_key,
+            alpaca_secret,
+            base_url='https://data.alpaca.markets/v2',  # Live options data URL
+            api_version='v2'
+        )
+
+        # Add trading API for options orders
+        self.trading_api = tradeapi.REST(
+            alpaca_key,
+            alpaca_secret,
+            base_url='https://api.alpaca.markets/v2',  # Live options trading URL
+            api_version='v2'
+        )
+
+        self.symbols = ['SPY', 'QQQ', 'TSLA', 'NVDA', 'AMD', 'AAPL', 'SMCI', 'IWM', 'COIN']
         self.data = {}
         self.gmail_user = gmail_user
         self.gmail_password = gmail_password
-        self.on_fire_alerts = set()
-        self.rigged_alerts = []
-        self.trade_log_file = 'trade_log.csv'
-        self.max_position_value = 10000  # Maximum position size in dollars
-        self.initialize_trade_log()
-        
-        # Verify account is setup for live trading
-        account = self.alpaca_api.get_account()
-        if account.status != 'ACTIVE':
-            raise Exception(f"Account is not active for trading. Status: {account.status}")
-        if not account.trading_enabled:
-            raise Exception("Trading is not enabled on this account")
-        logger.info("Live trading account verified and active")
+        self.active_trades = {}
+        logger.info(f"ZeroDTEStrategy initialized with symbols: {', '.join(self.symbols)}")
 
-    def initialize_trade_log(self):
-        with open(self.trade_log_file, 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Timestamp', 'Stock', 'Action', 'Price', 'Quantity', 'Price Sold At', 'Dollar Difference', 'Percent Change'])
-
-    def log_trade(self, stock, action, price, quantity, price_sold_at=None, dollar_diff=None, percent_change=None):
-        with open(self.trade_log_file, 'a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                stock,
-                action,
-                price,
-                quantity,
-                price_sold_at if price_sold_at is not None else '',
-                f'${dollar_diff:.2f}' if dollar_diff is not None else '',
-                f'{percent_change:.2f}%' if percent_change is not None else ''
-            ])
-
-    def is_trading_hours(self):
-        current_time = datetime.now(pytz.timezone('US/Eastern')).time()
-        return time(9, 30) <= current_time <= time(16, 0)
-
-    def test_api_connection(self):
+    def verify_connections(self):
+        """Verify all connections are working"""
         try:
+            # Test the API connection
             account = self.alpaca_api.get_account()
-            logger.info(f"Successfully connected to Alpaca API. Account status: {account.status}")
-            buying_power = float(account.buying_power)
-            logger.info(f"Current buying power: ${buying_power}")
-            return True
+            logger.info(f"Successfully connected to Alpaca. Account status: {account.status}")
+            
+            # Test Gmail credentials
+            try:
+                mail = imaplib.IMAP4_SSL('imap.gmail.com')
+                mail.login(self.gmail_user, self.gmail_password)
+                logger.info("Successfully connected to Gmail")
+                mail.logout()
+                return True
+            except Exception as e:
+                logger.error(f"Gmail authentication failed: {str(e)}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Failed to connect to Alpaca API: {str(e)}")
+            logger.error(f"Strategy connection verification failed: {str(e)}")
             return False
-
+    
     def run(self):
-        if not self.test_api_connection():
-            logger.error("Failed to establish API connection. Exiting.")
+        """Main strategy loop"""
+        logger.info("Strategy starting...")
+        
+        # Test initial connections
+        try:
+            # Test Alpaca connection
+            logger.info("Testing Alpaca connection...")
+            account = self.alpaca_api.get_account()
+            logger.info(f"Successfully connected to Alpaca. Account Status: {account.status}")
+            logger.info(f"Current buying power: ${account.buying_power}")
+            
+            # Test Gmail monitoring
+            if not self.test_gmail_monitor():
+                logger.error("Gmail monitoring test failed")
+                return
+                
+            logger.info("All initial tests passed, starting main loop")
+            
+        except Exception as e:
+            logger.error(f"Failed initial connection tests: {str(e)}")
             return
 
-        logger.info("Live trading strategy starting...")
         while True:
             try:
                 current_time = datetime.now(pytz.timezone('US/Eastern'))
-                logger.info(f"Strategy check at {current_time}")
-                
                 if self.is_trading_hours():
-                    logger.info("Market is open, checking conditions...")
+                    logger.info(f"Market is open at {current_time}. Checking for signals...")
+                    
+                    # Check Gmail for new alerts
+                    logger.info("Checking Gmail for new alerts...")
                     self.check_gmail_alerts()
-                    for symbol in self.symbols:
-                        try:
-                            if self.update_market_data_for_symbol(symbol):
-                                self.analyze_market_conditions_for_symbol(symbol)
-                                self.check_entry_conditions_for_symbol(symbol)
-                        except Exception as e:
-                            logger.error(f"Error processing symbol {symbol}: {str(e)}")
+                    
+                    # Manage existing positions
                     self.manage_positions()
+                    
                 else:
-                    logger.info("Market is closed")
+                    logger.info(f"Market is closed at {current_time}. Sleeping...")
                 
                 time_module.sleep(60)  # Check every minute
                 
@@ -103,359 +115,753 @@ class ZeroDTEStrategy:
                 logger.error(f"Strategy error: {str(e)}")
                 time_module.sleep(300)  # Wait 5 minutes before retrying
 
+    def test_gmail_monitor(self):
+        """Test Gmail connection and monitoring capabilities"""
+        try:
+            logger.info("Testing Gmail connection...")
+            mail = imaplib.IMAP4_SSL('imap.gmail.com')
+            status = mail.login(self.gmail_user, self.gmail_password)[0]
+            logger.info(f"Gmail login successful: {status}")
+            
+            # Select inbox
+            mail.select('inbox')
+            logger.info("Successfully selected inbox")
+            
+            # Try to search for messages (simple test)
+            _, messages = mail.search(None, 'ALL')
+            logger.info("Successfully tested mail search")
+            
+            # Clean up
+            mail.close()
+            mail.logout()
+            logger.info("Gmail test completed successfully")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Gmail monitor test failed: {str(e)}")
+            return False
+
+    def is_trading_hours(self):
+        """Check if current time is during trading hours"""
+        est = pytz.timezone('US/Eastern')
+        now = datetime.now(est)
+        current_time = now.time()
+        
+        if now.weekday() >= 5:  # Weekend
+            logger.info(f"Market closed: Weekend (day {now.weekday()})")
+            return False
+        
+        market_open = time(9, 30)
+        market_close = time(16, 0)
+        
+        is_trading = market_open <= current_time <= market_close
+        
+        if not is_trading:
+            if current_time < market_open:
+                logger.info(f"Market closed: Before market open ({current_time} < {market_open} EST)")
+            elif current_time > market_close:
+                logger.info(f"Market closed: After market close ({current_time} > {market_close} EST)")
+        else:
+            logger.info(f"Market open: {current_time} EST")
+        
+        return is_trading
+
+    def process_alert(self, subject, body):
+        """Process alerts and handle existing positions"""
+        try:
+            logger.info("==== PROCESSING ALERT ====")
+            logger.info(f"Alert Subject: {subject}")
+            logger.info(f"Alert Body: {body}")
+
+            # Only handle WR alerts
+            if "WR" in subject:
+                try:
+                    parts = subject.split(' - ')
+                    symbol = parts[1].split()[1]  # Expects format: "XX% WR - SYMBOL BULL/BEAR"
+                    direction = 'BULL' if 'BULL' in subject else 'BEAR'
+                    
+                    if symbol not in self.symbols:
+                        logger.error(f"Symbol {symbol} not in tracked list")
+                        return False
+
+                    logger.info(f"WR Alert - Symbol: {symbol}, Direction: {direction}")
+
+                    # Check if we have an existing position
+                    if symbol in self.active_trades:
+                        current_position = self.active_trades[symbol]
+                        current_direction = current_position['direction']
+                        
+                        logger.info(f"Found existing position for {symbol}")
+                        logger.info(f"Current position direction: {current_direction}")
+                        logger.info(f"New alert direction: {direction}")
+                        
+                        # If directions match, keep the position
+                        if current_direction == direction:
+                            logger.info(f"New alert matches current position direction. Keeping position.")
+                            return True
+                        else:
+                            # Directions don't match, exit the position
+                            logger.info(f"New alert opposite to current position direction. Exiting position.")
+                            positions = self.alpaca_api.list_positions()
+                            for pos in positions:
+                                if pos.symbol == symbol:
+                                    return self.exit_full_position(pos)
+                            return False
+
+                    # No existing position, execute new trade
+                    return self.execute_trade({'symbol': symbol, 'direction': direction, 'alert_type': 'WR'})
+
+                except Exception as e:
+                    logger.error(f"Error parsing WR alert: {str(e)}")
+                    logger.error(traceback.format_exc())  # Added full traceback for better debugging
+                    return False
+            else:
+                logger.info("Ignoring non-WR alert")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error processing alert: {str(e)}", exc_info=True)
+            return False
+
+    def execute_trade(self, trade_details):
+        """Execute trade based on alert information"""
+        try:
+            logger.info("=== TRADE EXECUTION START ===")
+            logger.info(f"Trade details received: {json.dumps(trade_details, indent=2)}")
+            
+            # Check PDT limit first
+            from main import pdt_tracker
+            can_trade, use_next_day = pdt_tracker.can_trade()
+            if not can_trade:
+                next_date = pdt_tracker.get_next_available_trade_date()
+                logger.warning(f"Cannot execute trade: Weekly trade limit (3) reached. Next available trade date: {next_date}")
+                return False
+            
+            # Define base URLs for different API versions
+            DATA_URL = "https://data.alpaca.markets/v1beta1"  # Keep v1beta1 for market data
+            TRADING_URL = "https://api.alpaca.markets/v2"  # Changed to v2 endpoint
+            
+            if not self.is_trading_hours():
+                logger.error("Cannot execute trade outside trading hours")
+                return False
+
+            symbol = trade_details['symbol']
+            direction = trade_details.get('direction')
+            strike = trade_details.get('strike')
+
+            logger.info(f"Processing trade for {symbol} direction: {direction} strike: {strike}")
+
+            if symbol not in self.symbols:
+                logger.error(f"Symbol {symbol} not in tracked list: {self.symbols}")
+                return False
+
+            # Get account info
+            account = self.alpaca_api.get_account()
+            buying_power = float(account.buying_power)
+            logger.info(f"Account Status: {account.status}")
+            logger.info(f"Account Buying Power: ${buying_power}")
+
+            # If no strike price provided, get the ATM strike and adjust based on direction
+            if not strike:
+                try:
+                    latest_trade = self.alpaca_api.get_latest_trade(symbol)
+                    current_price = float(latest_trade.price)
+                    # Round to nearest $1 instead of $5
+                    atm_strike = round(current_price)
+                    
+                    # For calls, go one strike below current price
+                    # For puts, go one strike above current price
+                    if direction == 'BULL':
+                        strike = atm_strike - 1  # One strike below current price
+                        logger.info(f"BULL trade: Using strike {strike} (below current price {current_price})")
+                    else:  # BEAR
+                        strike = atm_strike + 1  # One strike above current price
+                        logger.info(f"BEAR trade: Using strike {strike} (above current price {current_price})")
+                    
+                    logger.info(f"Current price: ${current_price}, ATM strike: ${atm_strike}, Selected strike: ${strike}")
+                except Exception as e:
+                    logger.error(f"Failed to get strike price: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    return False
+
+            # Get expiration date based on PDT status
+            today = datetime.now()
+            if use_next_day:
+                # If at PDT limit, use tomorrow's date
+                # If today is Friday, use Monday
+                if today.weekday() == 4:  # Friday
+                    expiration_date = (today + timedelta(days=3)).strftime('%Y-%m-%d')
+                    logger.info(f"At PDT limit on Friday, using Monday expiration: {expiration_date}")
+                else:
+                    expiration_date = (today + timedelta(days=1)).strftime('%Y-%m-%d')
+                    logger.info(f"At PDT limit, using next day expiration: {expiration_date}")
+            else:
+                expiration_date = today.strftime('%Y-%m-%d')
+                logger.info(f"Using same day expiration: {expiration_date}")
+
+            # Get all options snapshots for the symbol
+            options_url = f"{DATA_URL}/options/snapshots/{symbol}?expiration_date={expiration_date}"
+            headers = {
+                'APCA-API-KEY-ID': self.alpaca_api._key_id,
+                'APCA-API-SECRET-KEY': self.alpaca_api._secret_key
+            }
+
+            logger.info(f"Fetching options snapshots URL: {options_url}")
+
+            try:
+                all_strikes = []
+                next_page_token = None
+                
+                while True:
+                    # Add page token if we have one
+                    url = options_url
+                    if next_page_token:
+                        url += f"?page_token={next_page_token}"
+                    
+                    options_response = requests.get(url, headers=headers)
+                    logger.info(f"Options Response Status: {options_response.status_code}")
+                    
+                    if options_response.status_code != 200:
+                        logger.error(f"Failed to get options snapshots: {options_response.text}")
+                        return False
+
+                    options_data = options_response.json()
+                    snapshots = options_data.get('snapshots', {})
+                    
+                    for symbol, data in snapshots.items():
+                        try:
+                            # Determine if this is a call or put
+                            is_call = 'C' in symbol
+                            
+                            # Skip if option type doesn't match direction
+                            if (direction == 'BULL' and not is_call) or (direction == 'BEAR' and is_call):
+                                continue
+                            
+                            strike_price = float(symbol[-8:]) / 1000
+                            
+                            # Get quote data with validation
+                            quote = data.get('latestQuote', {})
+                            ask_price = float(quote.get('askPrice', quote.get('ap', 0)))
+                            bid_price = float(quote.get('bidPrice', quote.get('bp', 0)))
+                            
+                            # Quote validation
+                            if ask_price <= 0 or bid_price <= 0:
+                                logger.debug(f"Skipping {symbol} - Invalid quotes: Ask=${ask_price}, Bid=${bid_price}")
+                                continue
+                            
+                            if ask_price < bid_price:
+                                logger.debug(f"Skipping {symbol} - Inverted quotes: Ask=${ask_price}, Bid=${bid_price}")
+                                continue
+                            
+                            spread_percentage = (ask_price - bid_price) / ask_price
+                            if spread_percentage > 0.20:
+                                logger.debug(f"Skipping {symbol} - Wide spread: {spread_percentage:.2%}")
+                                continue
+                            
+                            # Only add if it matches our target strike
+                            if strike_price == strike:
+                                all_strikes.append({
+                                    'symbol': symbol,
+                                    'strike': strike_price,
+                                    'data': data,
+                                    'ask': ask_price,
+                                    'bid': bid_price,
+                                    'spread': spread_percentage
+                                })
+                                logger.info(f"Found matching contract: {symbol} at strike {strike_price}")
+                                break  # We found our exact strike match
+                            
+                        except ValueError as e:
+                            logger.error(f"Error parsing contract {symbol}: {e}")
+                            continue
+                    
+                    # If we found our strike, no need to continue pagination
+                    if all_strikes:
+                        break
+                        
+                    next_page_token = options_data.get('next_page_token')
+                    if not next_page_token:
+                        break
+
+                # Verify we found our desired contract
+                if not all_strikes:
+                    logger.error(f"No valid contracts found for strike ${strike}")
+                    return False
+                    
+                # Select the contract (should only be one since we're looking for exact strike match)
+                desired_contract = all_strikes[0]
+                logger.info(f"Selected contract: {desired_contract['symbol']} at strike {desired_contract['strike']}")
+                logger.info(f"Quote details: Ask=${desired_contract['ask']}, Bid=${desired_contract['bid']}, Spread={desired_contract['spread']:.2%}")
+
+                # Additional quote validation
+                ask_price = desired_contract['ask']
+                bid_price = desired_contract['bid']
+                
+                if ask_price <= 0 or bid_price <= 0:
+                    logger.error(f"Invalid quote prices: Ask=${ask_price}, Bid=${bid_price}")
+                    return False
+
+                # Calculate contract details with minimum validation
+                contract_price = (ask_price + bid_price) / 2
+                min_contract_cost = contract_price * 100
+
+                if buying_power < min_contract_cost:
+                    logger.error(f"Insufficient buying power (${buying_power}) for minimum contract cost (${min_contract_cost})")
+                    return False
+
+                # Calculate number of contracts using 90% of buying power
+                max_safe_spending = buying_power * 0.90  # Changed from 0.75 to 0.90
+                num_contracts = int(max_safe_spending / min_contract_cost)
+                num_contracts = max(1, min(num_contracts, 10))  # Ensure at least 1 contract, cap at 10
+
+                logger.info(f"Contract calculations:")
+                logger.info(f"- Contract price: ${contract_price}")
+                logger.info(f"- Min contract cost: ${min_contract_cost}")
+                logger.info(f"- Max safe spending (90% of buying power): ${max_safe_spending}")
+                logger.info(f"- Raw contract calculation: {max_safe_spending / min_contract_cost}")
+                logger.info(f"- Final number of contracts: {num_contracts}")
+
+                # Submit the order with correct endpoint
+                order_url = f"{TRADING_URL}/orders"  # Updated endpoint path
+                order_data = {
+                    "symbol": desired_contract['symbol'],
+                    "qty": num_contracts,
+                    "side": "buy",
+                    "type": "limit",
+                    "time_in_force": "day",
+                    "limit_price": ask_price,
+                    "asset_class": "option"  # Added asset_class parameter
+                }
+
+                logger.info(f"Submitting order:")
+                logger.info(f"URL: {order_url}")
+                logger.info(f"Order data: {json.dumps(order_data, indent=2)}")
+
+                try:
+                    order_response = requests.post(
+                        order_url, 
+                        headers=headers, 
+                        json=order_data
+                    )
+                    logger.info(f"Order Response Status: {order_response.status_code}")
+                    logger.info(f"Order Response Body: {order_response.text}")
+
+                    if order_response.status_code not in [200, 201]:
+                        logger.error(f"Order submission failed: {order_response.text}")
+                        return False
+
+                    order = order_response.json()
+                    logger.info(f"Order response: {json.dumps(order, indent=2)}")
+                    
+                    # Record the trade in PDT tracker
+                    trades_remaining = pdt_tracker.add_trade({
+                        'symbol': symbol,
+                        'type': 'entry',
+                        'direction': direction,
+                        'quantity': num_contracts,
+                        'price': contract_price,
+                        'strike': strike
+                    })
+                    
+                    logger.info(f"Trade recorded in PDT tracker. {trades_remaining} trades remaining this week.")
+
+                except Exception as e:
+                    logger.error(f"Error submitting order: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    return False
+
+                # Track the trade
+                self.active_trades[symbol] = {
+                    'order_id': order['id'],
+                    'entry_time': datetime.now(),
+                    'direction': direction,
+                    'strike': strike,
+                    'option_symbol': desired_contract['symbol'],
+                    'num_contracts': num_contracts,
+                    'contract_cost': min_contract_cost,
+                    'entry_price': contract_price,
+                    'initial_quantity': num_contracts,
+                    'current_quantity': num_contracts,
+                    'profit_stages_taken': [],
+                    'last_profit_level': 0,
+                    'alert_type': trade_details['alert_type']
+                }
+
+                logger.info(f"✅ Order submitted successfully: {order['id']}")
+                logger.info(f"Trade details: {num_contracts} contracts of {desired_contract['symbol']} at ${contract_price}")
+                return True
+
+            except Exception as e:
+                logger.error(f"❌ Trade execution error: {str(e)}")
+                logger.error(traceback.format_exc())
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Trade execution error: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
+
+    def get_email_body(self, email_message):
+        """Extract email body with better handling of multipart messages"""
+        try:
+            if email_message.is_multipart():
+                # Handle multipart messages
+                for part in email_message.walk():
+                    if part.get_content_type() == "text/plain":
+                        try:
+                            # Try UTF-8 first
+                            return part.get_payload(decode=True).decode('utf-8')
+                        except UnicodeDecodeError:
+                            # Fall back to other encodings
+                            try:
+                                return part.get_payload(decode=True).decode('iso-8859-1')
+                            except:
+                                return part.get_payload(decode=True).decode('ascii', errors='ignore')
+            else:
+                # Handle single part messages
+                try:
+                    return email_message.get_payload(decode=True).decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        return email_message.get_payload(decode=True).decode('iso-8859-1')
+                    except:
+                        return email_message.get_payload(decode=True).decode('ascii', errors='ignore')
+        except Exception as e:
+            logger.error(f"Error extracting email body: {str(e)}")
+            return ""
+
     def check_gmail_alerts(self):
+        """Check Gmail for trading alerts"""
         mail = None
         try:
+            logger.info("🔍 Starting Gmail check for alerts...")
             mail = imaplib.IMAP4_SSL('imap.gmail.com')
-            if not mail.login(self.gmail_user, self.gmail_password)[0] == 'OK':
-                logger.error("Failed to login to Gmail")
+            status, _ = mail.login(self.gmail_user, self.gmail_password)
+            logger.info(f"📧 Gmail login status: {status}")
+            
+            if status != 'OK':
+                logger.error("❌ Failed to login to Gmail")
                 return
                 
             mail.select('inbox')
-            _, search_data = mail.search(None, 'UNSEEN SUBJECT "RIGGED AI Alert"')
             
-            for num in search_data[0].split():
-                _, data = mail.fetch(num, '(RFC822)')
-                _, bytes_data = data[0]
-                email_message = email.message_from_bytes(bytes_data)
-                subject = decode_header(email_message["subject"])[0][0]
-                if isinstance(subject, bytes):
-                    subject = subject.decode()
+            # Only search for WR alerts
+            try:
+                # Search for unread emails with "WR" in subject
+                _, search_data = mail.search(None, 'UNSEEN SUBJECT "WR"')
+                email_ids = search_data[0].split()
+                logger.info(f"📨 Found {len(email_ids)} new WR alerts")
                 
-                if "ON FIRE" in subject:
-                    self.process_on_fire_alert(subject)
-                elif "Tradeability" in subject:
-                    self.process_tradeability_alert(subject)
-                
-                mail.store(num, '+FLAGS', '\\Seen')
-            logger.info("Checked Gmail alerts successfully")
+                for num in email_ids:
+                    try:
+                        _, data = mail.fetch(num, '(RFC822)')
+                        email_body = data[0][1]
+                        email_message = email.message_from_bytes(email_body)
+                        
+                        # Get and decode subject
+                        subject = decode_header(email_message["subject"])[0][0]
+                        if isinstance(subject, bytes):
+                            subject = subject.decode()
+                        
+                        body = self.get_email_body(email_message)
+                        
+                        logger.info(f"Processing WR alert - Subject: {subject}")
+                        logger.info(f"Alert body preview: {body[:200]}...")
+                        
+                        # Process the alert
+                        result = self.process_alert(subject, body)
+                        if result:
+                            mail.store(num, '+FLAGS', '\\Seen')
+                            logger.info("✅ WR Alert processed and marked as read")
+                        else:
+                            logger.warning("⚠️ WR Alert processing failed, leaving unread")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Error processing individual WR alert: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        continue
+                        
+            except Exception as e:
+                logger.error(f"❌ Error in WR alerts section: {str(e)}")
+                logger.error(traceback.format_exc())
             
         except Exception as e:
-            logger.error(f"Error checking Gmail alerts: {str(e)}", exc_info=True)
+            logger.error(f"❌ Error checking Gmail alerts: {str(e)}", exc_info=True)
         finally:
             if mail:
                 try:
                     if mail.state != 'NONAUTH':
                         mail.close()
                     mail.logout()
+                    logger.info("📭 Gmail connection closed")
                 except Exception as e:
-                    logger.error(f"Error closing Gmail connection: {str(e)}")
+                    logger.error(f"❌ Error closing Gmail connection: {str(e)}")
 
-    def process_on_fire_alert(self, subject):
+    def process_wr_alert(self, subject, body):
+        """Process WR alerts with improved parsing"""
         try:
-            parts = subject.split()
-            if len(parts) < 3:
-                logger.error(f"Invalid ON FIRE alert format: {subject}")
-                return
-
-            symbol = parts[2]
-            if symbol not in self.data:
-                self.data[symbol] = {}
-            if symbol not in self.symbols:
-                self.symbols.append(symbol)
-                logger.info(f"Added new symbol to track: {symbol}")
-
-            side = parts[3] if len(parts) > 3 else "Unknown"
-            gain = float(parts[5].strip('%')) if len(parts) > 5 else 0
-            alert_time = int(parts[7]) if len(parts) > 7 else 0
-
-            self.on_fire_alerts.add((symbol, side, gain, alert_time))
-            logger.info(f"ON FIRE Alert: {symbol} {side} {gain}% in {alert_time} minutes")
-
-        except Exception as e:
-            logger.error(f"Error processing ON FIRE alert: {str(e)}", exc_info=True)
-
-    def process_tradeability_alert(self, subject):
-        try:
-            parts = subject.split()
-            symbol = parts[1]
-            tradeability = ' '.join(parts[3:])
+            # Log full alert details for debugging
+            logger.info(f"Processing WR alert - Subject: {subject}")
+            logger.info(f"Alert body: {body}")
             
-            if symbol not in self.data:
-                self.data[symbol] = {}
+            # Check for BULL/BEAR in both subject and body
+            alert_text = f"{subject} {body}".upper()
             
-            self.data[symbol]['tradeability'] = tradeability
-            logger.info(f"Tradeability Alert: {symbol} is now {tradeability}")
-        except Exception as e:
-            logger.error(f"Error processing Tradeability alert: {str(e)}", exc_info=True)
-
-    def update_market_data_for_symbol(self, symbol):
-        try:
-            bars = self.alpaca_api.get_bars(symbol, '1Min', limit=100).df
-            if bars.empty:
-                logger.warning(f"No data received for {symbol}")
-                return False
-                
-            logger.info(f"Retrieved {len(bars)} bars for {symbol}")
-            self.data[symbol] = {
-                'bars': bars,
-                'current_price': bars.close.iloc[-1],
-                'open_price': bars.open.iloc[0],
-                'volume': bars.volume.sum(),
-                'high': bars.high.max(),
-                'low': bars.low.min()
-            }
-            logger.info(f"Updated market data for {symbol}: Price=${self.data[symbol]['current_price']:.2f}, Volume={self.data[symbol]['volume']}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating market data for {symbol}: {str(e)}", exc_info=True)
-            return False
-
-    def analyze_market_conditions_for_symbol(self, symbol):
-        try:
-            if not self.data.get(symbol):
-                logger.error(f"No market data available for {symbol}")
-                return False
-                
-            self.data[symbol]['tradeability'] = self.calculate_tradeability(symbol)
-            self.data[symbol]['ps'] = self.calculate_position_score(symbol)
-            self.data[symbol]['blue_line_relation'] = self.determine_blue_line_relationship(symbol)
-            
-            logger.info(f"Analyzed {symbol}: Tradeability={self.data[symbol]['tradeability']}, PS={self.data[symbol]['ps']:.2f}, Blue Line={self.data[symbol]['blue_line_relation']:.2f}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error analyzing market conditions for {symbol}: {str(e)}", exc_info=True)
-            return False
-
-    def calculate_tradeability(self, symbol):
-        try:
-            volume = self.data[symbol]['volume']
-            avg_volume = self.data[symbol]['bars'].volume.mean()
-            volume_ratio = volume / avg_volume if avg_volume > 0 else 0
-            
-            if volume_ratio > 1.2:
-                return "FULL SEND"
-            elif volume_ratio > 1.1:
-                return "EASY MODE"
-            elif volume_ratio > 1.0:
-                return "NORMAL"
-            elif volume_ratio > 0.9:
-                return "HARD MODE"
+            # Determine direction
+            if 'BULL' in alert_text:
+                direction = 'BULL'
+            elif 'BEAR' in alert_text:
+                direction = 'BEAR'
             else:
-                return "NIGHTMARE"
-                
-        except Exception as e:
-            logger.error(f"Error calculating tradeability for {symbol}: {str(e)}")
-            return "NIGHTMARE"
-
-    def calculate_position_score(self, symbol):
-        try:
-            bars = self.data[symbol]['bars']
-            current_price = self.data[symbol]['current_price']
-            open_price = self.data[symbol]['open_price']
-            high = self.data[symbol]['high']
-            low = self.data[symbol]['low']
-            
-            ps = ((current_price - open_price) + 
-                  (current_price - low) + 
-                  (high - current_price))
-            return ps
-            
-        except Exception as e:
-            logger.error(f"Error calculating position score for {symbol}: {str(e)}")
-            return 0
-
-    def determine_blue_line_relationship(self, symbol):
-        try:
-            return self.data[symbol]['current_price'] - self.data[symbol]['open_price']
-        except Exception as e:
-            logger.error(f"Error determining blue line relationship for {symbol}: {str(e)}")
-            return 0
-
-    def check_entry_conditions_for_symbol(self, symbol):
-        try:
-            tradeability = self.data[symbol]['tradeability']
-            if tradeability not in ["EASY MODE", "FULL SEND"]:
+                logger.error(f"❌ No direction (BULL/BEAR) found in WR alert text: {alert_text}")
                 return False
                 
-            ps = self.data[symbol]['ps']
-            blue_line_relation = self.data[symbol]['blue_line_relation']
-            
-            # Check for existing position
-            try:
-                position = self.alpaca_api.get_position(symbol)
-                logger.info(f"Already have position in {symbol}, skipping entry")
-                return False
-            except:
-                pass  # No position exists
-            
-            if ps > 0 and blue_line_relation > 0:
-                logger.info(f"Entry conditions met for {symbol} LONG")
-                return self.enter_trade(symbol, 'buy')
-            elif ps < 0 and blue_line_relation < 0:
-                logger.info(f"Entry conditions met for {symbol} SHORT")
-                return self.enter_trade(symbol, 'sell')
+            logger.info(f"Found direction: {direction}")
                 
-            return False
+            # Look for any symbol from our tracked list
+            found_symbol = None
+            for symbol in self.symbols:
+                if symbol in alert_text:
+                    found_symbol = symbol
+                    break
+                    
+            if not found_symbol:
+                logger.error(f"❌ No valid symbol found in WR alert text: {alert_text}")
+                return False
+                    
+            logger.info(f"Found symbol: {found_symbol}")
+                
+            # Try to extract WR percentage
+            wr_match = re.search(r'(\d+(?:\.\d+)?)\s*%', alert_text)
+            wr_percent = float(wr_match.group(1)) if wr_match else None
+                
+            if wr_percent is not None:
+                logger.info(f"Found WR percentage: {wr_percent}%")
+                    
+                # Apply WR filters
+                if direction == 'BULL' and wr_percent < 50:
+                    logger.info(f"Skipping BULL trade - WR {wr_percent}% below 50% threshold")
+                    return False
+                elif direction == 'BEAR' and wr_percent < 70:
+                    logger.info(f"Skipping BEAR trade - WR {wr_percent}% below 70% threshold")
+                    return False
             
+            # Look for strike price in alert
+            strike_match = re.search(r'STRIKE[:\s]+(\d+(?:\.\d+)?)', alert_text)
+            strike = float(strike_match.group(1)) if strike_match else None
+                
+            if strike:
+                logger.info(f"Found strike price: {strike}")
+                    
+            logger.info(f"🎯 Parsed WR alert - Symbol: {found_symbol}, Direction: {direction}" + 
+                       (f", WR: {wr_percent}%" if wr_percent else "") +
+                       (f", Strike: {strike}" if strike else ""))
+                
+            trade_details = {
+                'symbol': found_symbol,
+                'direction': direction,
+                'alert_type': 'WR',
+                'wr_percent': wr_percent,
+                'strike': strike
+            }
+                
+            return self.execute_trade(trade_details)
+                    
         except Exception as e:
-            logger.error(f"Error checking entry conditions for {symbol}: {str(e)}", exc_info=True)
-            return False
-
-    def enter_trade(self, symbol, side):
-        try:
-            logger.info(f"Attempting to enter live trade: {symbol} {side}")
-            
-            # Check account status
-            account = self.alpaca_api.get_account()
-            if float(account.buying_power) < 1000:  # Minimum buying power requirement
-                logger.error(f"Insufficient buying power: ${account.buying_power}")
-                return False
-                
-            # Get current price and calculate position size
-            current_price = self.data[symbol]['current_price']
-            max_shares = min(
-                int(self.max_position_value / current_price),
-                int(float(account.buying_power) * 0.95 / current_price)  # Use 95% of buying power max
-            )
-            
-            if max_shares < 1:
-                logger.error(f"Insufficient funds to purchase minimum position")
-                return False
-                
-            # Submit order with additional safety parameters
-            order = self.alpaca_api.submit_order(
-                symbol=symbol,
-                qty=max_shares,
-                side=side,
-                type='limit',  # Use limit orders for more control
-                time_in_force='day',
-                limit_price=current_price * (1.01 if side == 'buy' else 0.99),  # 1% price protection
-                order_class='simple'
-            )
-            
-            logger.info(f"Live order submitted: {order}")
-            self.log_trade(symbol, f'Enter {side.capitalize()}', current_price, max_shares)
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error entering live trade for {symbol} {side}: {str(e)}", exc_info=True)
+            logger.error(f"❌ Error processing WR alert: {str(e)}")
+            traceback.print_exc()  # Print full traceback for debugging
             return False
 
     def manage_positions(self):
+        """Manage existing positions with multi-stage profit taking"""
         try:
+            if not self.is_trading_hours():
+                logger.info("Skipping position management outside trading hours")
+                return
+                
             positions = self.alpaca_api.list_positions()
-            
             for position in positions:
-                symbol = position.symbol
-                unrealized_pl = float(position.unrealized_plpc)
-                current_value = float(position.market_value)
-                
-                # Exit conditions for live trading
-                should_exit = (
-                    unrealized_pl >= 0.02 or  # Take profit at 2%
-                    unrealized_pl <= -0.01 or  # Stop loss at 1%
-                    current_value > self.max_position_value * 1.1 or  # Position too large
-                    datetime.now(pytz.timezone('US/Eastern')).time() > time(15, 45)  # Close near end of day
-                )
-                
-                if should_exit:
-                    self.exit_trade(position)
-                    
+                if position.symbol in self.active_trades:
+                    self.check_exit_conditions(position)
         except Exception as e:
-            logger.error(f"Error managing live positions: {str(e)}", exc_info=True)
+            logger.error(f"Error managing positions: {str(e)}", exc_info=True)
 
-    def exit_trade(self, position):
+    def check_exit_conditions(self, position):
+        """
+        Implement two different profit-taking strategies based on number of contracts:
+        
+        For positions < 4 contracts:
+        - Full exit at +10% gain or -5% loss (whichever comes first)
+        
+        For positions >= 4 contracts:
+        - 25% at 10% gain
+        - 25% at 15% gain
+        - 25% at 20% gain
+        - 25% at 25% gain
+        - Initial stop loss at -5%
+        - Additional stop loss at 5% below last profit take
+        """
         try:
             symbol = position.symbol
-            quantity = abs(float(position.qty))
-            current_price = float(position.current_price)
-            entry_price = float(position.avg_entry_price)
+            trade_info = self.active_trades[symbol]
+            current_pl = float(position.unrealized_plpc)
             
-            # Additional safety checks for live trading
-            if quantity < 1:
-                logger.error(f"Invalid position quantity for {symbol}: {quantity}")
-                return False
+            logger.info(f"=== CHECKING EXIT CONDITIONS ===")
+            logger.info(f"Symbol: {symbol}")
+            logger.info(f"Current P/L: {current_pl:.2%}")
+            
+            # Create a JSON-safe version of trade_info for logging
+            log_info = {
+                'symbol': symbol,
+                'direction': trade_info.get('direction'),
+                'strike': trade_info.get('strike'),
+                'option_symbol': trade_info.get('option_symbol'),
+                'num_contracts': trade_info.get('num_contracts'),
+                'contract_cost': trade_info.get('contract_cost'),
+                'entry_price': trade_info.get('entry_price'),
+                'initial_quantity': trade_info.get('initial_quantity'),
+                'current_quantity': trade_info.get('current_quantity'),
+                'profit_stages_taken': trade_info.get('profit_stages_taken', []),
+                'last_profit_level': trade_info.get('last_profit_level', 0),
+                'alert_type': trade_info.get('alert_type'),
+                'entry_time': trade_info.get('entry_time').isoformat() if trade_info.get('entry_time') else None
+            }
+            
+            logger.info(f"Position Details: {json.dumps(log_info, indent=2)}")
+            
+            # Get initial position size if not stored
+            if 'initial_quantity' not in trade_info:
+                trade_info['initial_quantity'] = float(position.qty)
+                trade_info['current_quantity'] = float(position.qty)
+                trade_info['profit_stages_taken'] = []
+                trade_info['last_profit_level'] = 0
+                trade_info['first_check_time'] = datetime.now()  # Add first check time
+                logger.info("Initialized position tracking data")
+            
+            initial_quantity = trade_info['initial_quantity']
+            logger.info(f"Initial position size: {initial_quantity} contracts")
+            
+            # Different strategies based on position size
+            if initial_quantity < 4:
+                logger.info("Using small position strategy (single exit at +10% or -5%)")
                 
-            # Submit exit order with price protection
+                # Exit at +10% gain
+                if current_pl >= 0.10:
+                    logger.info(f"Small position +10% profit target reached at {current_pl:.2%}")
+                    return self.exit_full_position(position)
+                
+                # Wait 20 minutes before allowing a sell at -5% loss
+                time_since_first_check = datetime.now() - trade_info['first_check_time']
+                if current_pl <= -0.05 and time_since_first_check >= timedelta(minutes=20):
+                    logger.info(f"Small position -5% stop loss triggered at {current_pl:.2%} after 20 minutes")
+                    return self.exit_full_position(position)
+                    
+            else:
+                logger.info("Using large position strategy (staged profit taking)")
+                
+                # Base stop loss if no profit targets hit
+                if not trade_info['profit_stages_taken']:
+                    time_since_first_check = datetime.now() - trade_info['first_check_time']
+                    if current_pl <= -0.05 and time_since_first_check >= timedelta(minutes=20):
+                        logger.info(f"Initial stop loss triggered at {current_pl:.2%} after 20 minutes")
+                        return self.exit_full_position(position)
+                
+                # Stop loss relative to last profit take
+                last_profit_level = trade_info.get('last_profit_level', 0)
+                if trade_info['profit_stages_taken'] and current_pl < (last_profit_level - 0.05):
+                    logger.info(f"Trailing stop loss triggered. Current P/L: {current_pl:.2%}, Last profit level: {last_profit_level:.2%}")
+                    return self.exit_full_position(position)
+
+                # Define and check profit stages
+                profit_stages = [
+                    (0.10, 0.25),  # 10% profit, take 25%
+                    (0.15, 0.25),  # 15% profit, take 25%
+                    (0.20, 0.25),  # 20% profit, take 25%
+                    (0.25, 0.25)   # 25% profit, take 25%
+                ]
+                
+                logger.info("Checking profit taking stages...")
+                logger.info(f"Stages already taken: {trade_info['profit_stages_taken']}")
+                
+                for profit_target, size_to_sell in profit_stages:
+                    if profit_target not in trade_info['profit_stages_taken']:
+                        logger.info(f"Checking {profit_target:.2%} target...")
+                        
+                        if current_pl >= profit_target:
+                            logger.info(f"Profit target {profit_target:.2%} reached!")
+                            
+                            current_quantity = trade_info['current_quantity']
+                            contracts_to_sell = int(initial_quantity * size_to_sell)
+                            
+                            logger.info(f"Position details for profit taking:")
+                            logger.info(f"- Initial quantity: {initial_quantity}")
+                            logger.info(f"- Current quantity: {current_quantity}")
+                            logger.info(f"- Contracts to sell: {contracts_to_sell}")
+                            
+                            if contracts_to_sell > 0:
+                                logger.info(f"Executing profit take at {profit_target:.2%}")
+                                if self.exit_partial_position(position, contracts_to_sell):
+                                    trade_info['profit_stages_taken'].append(profit_target)
+                                    trade_info['last_profit_level'] = profit_target
+                                    trade_info['current_quantity'] -= contracts_to_sell
+
+        except Exception as e:
+            logger.error(f"Error checking exit conditions: {str(e)}")
+            logger.error(traceback.format_exc())  # Add full traceback for better debugging
+            return False
+
+    def exit_partial_position(self, position, qty_to_sell):
+        """Exit a portion of a position"""
+        try:
+            symbol = position.symbol
+            logger.info(f"Executing partial exit for {symbol}: {qty_to_sell} contracts")
+            
             order = self.alpaca_api.submit_order(
                 symbol=symbol,
-                qty=quantity,
-                side='sell' if position.side == 'long' else 'buy',
-                type='limit',
-                time_in_force='day',
-                limit_price=current_price * (0.99 if position.side == 'long' else 1.01)
+                qty=qty_to_sell,
+                side='sell',
+                type='market',
+                time_in_force='day'
             )
             
-            # Calculate P&L
-            dollar_diff = (current_price - entry_price) * quantity
-            percent_change = ((current_price - entry_price) / entry_price) * 100
-            
-            logger.info(f"Exited live trade: {symbol}, quantity {quantity}, P&L: ${dollar_diff:.2f} ({percent_change:.2f}%)")
-            self.log_trade(
-                symbol, 
-                'Exit', 
-                entry_price, 
-                quantity, 
-                current_price,
-                dollar_diff,
-                percent_change
-            )
+            logger.info(f"Partial exit order submitted: {order.id}")
             return True
             
         except Exception as e:
-            logger.error(f"Error exiting live trade for {position.symbol}: {str(e)}", exc_info=True)
+            logger.error(f"Error executing partial exit: {str(e)}")
             return False
 
-    def cancel_all_orders(self):
-        """Cancel all open orders."""
+    def exit_full_position(self, position):
+        """Exit entire remaining position"""
         try:
-            self.alpaca_api.cancel_all_orders()
-            logger.info("Cancelled all open orders")
+            symbol = position.symbol
+            remaining_qty = self.active_trades[symbol].get('current_quantity', position.qty)
+            logger.info(f"Exiting full position for {symbol}: {remaining_qty} contracts remaining")
+            
+            order = self.alpaca_api.submit_order(
+                symbol=symbol,
+                qty=remaining_qty,
+                side='sell',
+                type='market',
+                time_in_force='day'
+            )
+            
+            logger.info(f"Full exit order submitted: {order.id}")
+            
+            # Remove from active trades
+            if symbol in self.active_trades:
+                # Log final trade summary
+                trade_info = self.active_trades[symbol]
+                logger.info(f"Trade Summary for {symbol}:")
+                logger.info(f"Initial Quantity: {trade_info.get('initial_quantity')}")
+                logger.info(f"Profit Stages Taken: {trade_info.get('profit_stages_taken', [])}")
+                logger.info(f"Final Exit: Stop loss triggered at {float(position.unrealized_plpc):.2%}")
+                
+                del self.active_trades[symbol]
+            
+            return True
+            
         except Exception as e:
-            logger.error(f"Error cancelling orders: {str(e)}")
-
-    def liquidate_all_positions(self):
-        """Liquidate all positions."""
-        try:
-            self.alpaca_api.close_all_positions()
-            logger.info("Liquidated all positions")
-        except Exception as e:
-            logger.error(f"Error liquidating positions: {str(e)}")
-
-    def cleanup(self):
-        """Cleanup method to be called on shutdown."""
-        try:
-            logger.info("Initiating cleanup procedure...")
-            self.cancel_all_orders()
-            self.liquidate_all_positions()
-            logger.info("Cleanup completed successfully")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-
-if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("WARNING: This script is configured for LIVE trading.")
-    print("Real money will be at risk.")
-    print("="*50 + "\n")
-    
-    confirmation = input("Type 'LIVE TRADING' to confirm you want to proceed with live trading: ")
-    if confirmation.upper() != 'LIVE TRADING':
-        print("Live trading cancelled. Exiting script.")
-        exit()
-
-    try:
-        logger.info("Initializing ZeroDTEStrategy for LIVE trading")
-        strategy = ZeroDTEStrategy(ALPACA_API_KEY, ALPACA_SECRET_KEY, GMAIL_USER, GMAIL_PASSWORD)
-        
-        # Register cleanup handler
-        import atexit
-        atexit.register(strategy.cleanup)
-        
-        # Start trading
-        strategy.run()
-        
-    except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, initiating graceful shutdown...")
-        strategy.cleanup()
-        print("\nTrading bot shutdown complete.")
-        
-    except Exception as e:
-        logger.error(f"Fatal error in main execution: {str(e)}", exc_info=True)
-        try:
-            strategy.cleanup()
-        except:
-            pass
-        print("\nTrading bot shutdown due to error.")
+            logger.error(f"Error exiting full position: {str(e)}")
+            return False

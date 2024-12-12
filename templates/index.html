@@ -3,147 +3,23 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trading Bot Dashboard</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        .status-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-left: 8px;
-        }
-        .status-active {
-            background-color: #28a745;
-        }
-        .status-inactive {
-            background-color: #dc3545;
-        }
-        .trades-table {
-            max-height: 400px;
-            overflow-y: auto;
-        }
-    </style>
+    <title>Trading Dashboard</title>
+
+    <!-- External stylesheets -->
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/styles.css') }}" rel="stylesheet">
+
+    <!-- Core dependencies -->
+    <script nonce="{{ nonce }}" src="https://unpkg.com/react@17/umd/react.production.min.js" crossorigin></script>
+    <script nonce="{{ nonce }}" src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js" crossorigin></script>
+
+    <!-- Application scripts -->
+    <script nonce="{{ nonce }}" src="{{ url_for('static', filename='js/icons.js') }}" defer></script>
+    <script nonce="{{ nonce }}" src="{{ url_for('static', filename='js/components.js') }}" defer></script>
+    <script nonce="{{ nonce }}" src="{{ url_for('static', filename='js/ControlPanel.js') }}" defer></script>
+    <script nonce="{{ nonce }}" src="{{ url_for('static', filename='js/app.js') }}" defer></script>
 </head>
 <body>
-    <div class="container mt-4">
-        <h1>Trading Bot Dashboard</h1>
-
-        <div class="row">
-            <div class="col-md-6">
-                <div class="card">
-                    <div class="card-header">
-                        Bot Status <span id="status-indicator" class="status-indicator"></span>
-                    </div>
-                    <div class="card-body">
-                        <p>Bot Running: <span id="bot-running">Checking...</span></p>
-                        <p>Trading Hours: <span id="trading-hours">Checking...</span></p>
-                        <p>Current Time: <span id="current-time">Checking...</span></p>
-                        <p>Next Market Open: <span id="next-open">Checking...</span></p>
-                        <p>Next Market Close: <span id="next-close">Checking...</span></p>
-                        <p>Symbols Tracked: <span id="symbols">Checking...</span></p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="col-md-6">
-                <div class="card">
-                    <div class="card-header">Current Positions</div>
-                    <div class="card-body">
-                        <div id="positions">Loading positions...</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card mt-4">
-            <div class="card-header">Trade History</div>
-            <div class="card-body">
-                <div id="trades" class="trades-table">Loading trades...</div>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-    <script>
-        // Function to update status
-        async function updateStatus() {
-            try {
-                const response = await fetch('/status');
-                const data = await response.json();
-                
-                document.getElementById('bot-running').textContent = data.strategy_running ? 'Yes' : 'No';
-                document.getElementById('trading-hours').textContent = data.is_trading_hours ? 'Active' : 'Closed';
-                document.getElementById('current-time').textContent = data.current_time;
-                document.getElementById('next-open').textContent = data.next_market_open;
-                document.getElementById('next-close').textContent = data.next_market_close;
-                document.getElementById('symbols').textContent = data.symbols_tracked.join(', ');
-                
-                const statusIndicator = document.getElementById('status-indicator');
-                statusIndicator.className = 'status-indicator ' + (data.strategy_running ? 'status-active' : 'status-inactive');
-            } catch (error) {
-                console.error('Error fetching status:', error);
-            }
-        }
-
-        // Function to update positions
-        async function updatePositions() {
-            try {
-                const response = await fetch('/positions');
-                const data = await response.json();
-                
-                if (data.positions && data.positions.length > 0) {
-                    const positionsHtml = data.positions.map(position => `
-                        <div class="position-item mb-2">
-                            <strong>${position.symbol}</strong><br>
-                            Quantity: ${position.qty}<br>
-                            Current Price: $${parseFloat(position.current_price).toFixed(2)}<br>
-                            P/L: ${(parseFloat(position.pl_day) * 100).toFixed(2)}%
-                        </div>
-                    `).join('');
-                    document.getElementById('positions').innerHTML = positionsHtml;
-                } else {
-                    document.getElementById('positions').innerHTML = 'No open positions';
-                }
-            } catch (error) {
-                console.error('Error fetching positions:', error);
-            }
-        }
-
-        // Function to update trades
-        async function updateTrades() {
-            try {
-                const response = await fetch('/trades');
-                const data = await response.json();
-                
-                if (data.trades && data.trades.length > 0) {
-                    const tradesHtml = data.trades.map(trade => `
-                        <div class="trade-item mb-2">
-                            <strong>${trade.symbol}</strong> - ${trade.action}<br>
-                            Price: $${parseFloat(trade.price).toFixed(2)}<br>
-                            Time: ${new Date(trade.timestamp).toLocaleString()}
-                        </div>
-                    `).join('');
-                    document.getElementById('trades').innerHTML = tradesHtml;
-                } else {
-                    document.getElementById('trades').innerHTML = 'No trade history';
-                }
-            } catch (error) {
-                console.error('Error fetching trades:', error);
-            }
-        }
-
-        // Update data every 30 seconds
-        setInterval(() => {
-            updateStatus();
-            updatePositions();
-            updateTrades();
-        }, 30000);
-
-        // Initial update
-        updateStatus();
-        updatePositions();
-        updateTrades();
-    </script>
+    <div id="root"></div>
 </body>
 </html>
