@@ -23,57 +23,119 @@ window.ControlPanel = function() {
         cash: 0
     });
 
+    // Separate data fetching functions for better control
+    const fetchStatus = async () => {
+        const response = await fetch('/api/status');
+        if (!response.ok) throw new Error(`Status API error: ${response.status}`);
+        return response.json();
+    };
+
+    const fetchPerformanceMetrics = async () => {
+        try {
+            const response = await fetch('/api/performance_metrics');
+            if (!response.ok) throw new Error(`Metrics API error: ${response.status}`);
+            const data = await response.json();
+            console.log('Raw performance metrics data:', data); // Debug log
+            return data;
+        } catch (error) {
+            console.error('Error fetching metrics:', error);
+            throw error;
+        }
+    };
+
+    const fetchPositions = async () => {
+        const response = await fetch('/api/positions');
+        if (!response.ok) throw new Error(`Positions API error: ${response.status}`);
+        return response.json();
+    };
+
+    const fetchTrades = async () => {
+        const response = await fetch('/api/trades');
+        if (!response.ok) throw new Error(`Trades API error: ${response.status}`);
+        return response.json();
+    };
+
+    const fetchAccount = async () => {
+        const response = await fetch('/api/account');
+        if (!response.ok) throw new Error(`Account API error: ${response.status}`);
+        return response.json();
+    };
+
+    const fetchAllData = async () => {
+        try {
+            console.log('Fetching all data...'); // Debug log
+            const [
+                statusData,
+                metricsData,
+                positionsData,
+                tradesData,
+                accountData
+            ] = await Promise.all([
+                fetchStatus(),
+                fetchPerformanceMetrics(),
+                fetchPositions(),
+                fetchTrades(),
+                fetchAccount()
+            ]);
+
+            setStatus(statusData);
+            setPerformanceMetrics(metricsData);
+            setPositions(positionsData.positions || []);
+            setTrades(tradesData.trades || []);
+            setAccount(accountData);
+            setError(null);
+            setIsLoading(false);
+
+            console.log('Data update complete:', {
+                metrics: metricsData,
+                positions: positionsData.positions,
+                trades: tradesData.trades
+            }); // Debug log
+        } catch (error) {
+            console.error('Error fetching data:', error);
+            setError(error.message);
+            setIsLoading(false);
+        }
+    };
+
+    // Effect for initial data load and polling
     React.useEffect(() => {
         let isMounted = true;
         let intervalId = null;
 
-        const fetchData = async () => {
-            try {
-                const endpoints = [
-                    '/api/status',
-                    '/api/performance_metrics',
-                    '/api/positions',
-                    '/api/trades',
-                    '/api/account'
-                ];
-
-                const responses = await Promise.all(endpoints.map(endpoint => 
-                    fetch(endpoint).then(response => {
-                        if (!response.ok) {
-                            throw new Error(`API error: ${response.status}`);
-                        }
-                        return response.json();
-                    })
-                ));
-
-                const [statusData, metricsData, positionsData, tradesData, accountData] = responses;
-
-                if (isMounted) {
-                    setStatus(statusData);
-                    setPerformanceMetrics(metricsData);
-                    setPositions(positionsData.positions || []);
-                    setTrades(tradesData.trades || []);
-                    setAccount(accountData);
-                    setError(null);
-                    setIsLoading(false);
-                }
-            } catch (error) {
-                console.error('Error fetching data:', error);
-                setError(error.message);
-                setIsLoading(false);
+        const initializeData = async () => {
+            if (isMounted) {
+                await fetchAllData();
             }
         };
 
-        // Initial fetch
-        fetchData();
+        initializeData();
 
-        // Set up polling if strategy is running
-        if (status.strategy_running) {
-            intervalId = setInterval(fetchData, 10000);
-        }
+        // Set up polling - more frequent updates when strategy is running
+        intervalId = setInterval(() => {
+            if (isMounted) {
+                fetchAllData();
+            }
+        }, 5000); // Poll every 5 seconds
 
         return () => {
             isMounted = false;
+            if (intervalId) {
+                clearInterval(intervalId);
+            }
+        };
+    }, []); // Empty dependency array for initial setup
+
+    // Additional effect specifically for strategy running state
+    React.useEffect(() => {
+        let intervalId = null;
+
+        if (status.strategy_running) {
+            // More frequent updates when strategy is running
+            intervalId = setInterval(fetchAllData, 2000); // Poll every 2 seconds when running
+        }
+
+        return () => {
             if (intervalId) {
                 clearInterval(intervalId);
             }
@@ -90,7 +152,7 @@ window.ControlPanel = function() {
                 throw new Error(`Failed to start strategy: ${response.status}`);
             }
             
-            const data = await response.json();
+            await fetchAllData(); // Immediately fetch new data after starting
             setStatus(prev => ({
                 ...prev,
                 strategy_running: true
@@ -111,7 +173,7 @@ window.ControlPanel = function() {
                 throw new Error(`Failed to stop strategy: ${response.status}`);
             }
             
-            const data = await response.json();
+            await fetchAllData(); // Immediately fetch new data after stopping
             setStatus(prev => ({
                 ...prev,
                 strategy_running: false
@@ -130,20 +192,23 @@ window.ControlPanel = function() {
                 method: 'POST'
             });
             if (response.ok) {
-                const positionsRes = await fetch('/api/positions');
-                const positionsData = await positionsRes.json();
-                setPositions(positionsData.positions || []);
+                await fetchAllData(); // Refresh all data after closing position
             }
         } catch (error) {
             console.error('Error closing position:', error);
         }
     };
 
+    // Main render
     return React.createElement('div', {
         className: 'min-h-screen bg-black p-6 text-white'
     }, 
-        isLoading ? React.createElement('div', null, 'Loading...') :
-        error ? React.createElement('div', null, 'Error: ' + error) :
+        isLoading ? React.createElement('div', {
+            className: 'flex items-center justify-center h-screen'
+        }, 'Loading dashboard...') :
+        error ? React.createElement('div', {
+            className: 'flex items-center justify-center h-screen text-red-500'
+        }, 'Error: ' + error) :
         React.createElement('div', {
             className: 'mx-auto max-w-7xl space-y-6'
         }, [
@@ -196,12 +261,12 @@ window.ControlPanel = function() {
                         className: 'flex justify-end space-x-2'
                     }, [
                         React.createElement('button', {
-                            className: 'bg-green-500 text-white px-4 py-2 rounded',
+                            className: `bg-green-500 text-white px-4 py-2 rounded ${status.strategy_running ? 'opacity-50 cursor-not-allowed' : ''}`,
                             onClick: handleStartStrategy,
                             disabled: status.strategy_running
                         }, 'Start Strategy'),
                         React.createElement('button', {
-                            className: 'bg-red-500 text-white px-4 py-2 rounded',
+                            className: `bg-red-500 text-white px-4 py-2 rounded ${!status.strategy_running ? 'opacity-50 cursor-not-allowed' : ''}`,
                             onClick: handleStopStrategy,
                             disabled: !status.strategy_running
                         }, 'Stop Strategy')
@@ -313,7 +378,7 @@ window.ControlPanel = function() {
                 ])
             ]),
 
-            // Positions Table
+            // Positions Table (only shown when positions exist)
             positions.length > 0 && React.createElement('div', {
                 key: 'positions-table',
                 className: 'bg-gray-800 rounded-lg p-6 space-y-4'
@@ -361,7 +426,7 @@ window.ControlPanel = function() {
                 ]))
             ]),
 
-            // Recent Trades Table
+            // Recent Trades Table (only shown when trades exist)
             trades.length > 0 && React.createElement('div', {
                 key: 'trades-table',
                 className: 'bg-gray-800 rounded-lg p-6 space-y-4'

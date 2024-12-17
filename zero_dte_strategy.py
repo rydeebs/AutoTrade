@@ -47,6 +47,58 @@ class ZeroDTEStrategy:
         self.gmail_password = gmail_password
         self.active_trades = {}
         logger.info(f"ZeroDTEStrategy initialized with symbols: {', '.join(self.symbols)}")
+        self.trade_history = []  # Add this line
+        self.completed_trades = {'won': 0, 'lost': 0}  # Add this line
+
+    def exit_full_position(self, position):
+        try:
+            symbol = position.symbol
+            remaining_qty = self.active_trades[symbol].get('current_quantity', position.qty)
+            pl_percentage = float(position.unrealized_plpc)
+            
+            # Record trade result before closing
+            is_win = pl_percentage > 0
+            self.completed_trades['won' if is_win else 'lost'] += 1
+            
+            # Add to trade history
+            self.trade_history.append({
+                'symbol': symbol,
+                'exit_time': datetime.now(),
+                'pl_percentage': pl_percentage,
+                'result': 'won' if is_win else 'lost'
+            })
+
+            # Submit sell order
+            order = self.alpaca_api.submit_order(
+                symbol=symbol,
+                qty=remaining_qty,
+                side='sell',
+                type='market',
+                time_in_force='day'
+            )
+            
+            logger.info(f"Exit order submitted: {order.id}")
+            
+            # Remove from active trades
+            if symbol in self.active_trades:
+                trade_info = self.active_trades[symbol]
+                time_in_trade = datetime.now() - trade_info['first_check_time']
+                
+                logger.info(f"=== TRADE SUMMARY ===")
+                logger.info(f"Symbol: {symbol}")
+                logger.info(f"Time in trade: {time_in_trade.total_seconds() / 60:.2f} minutes")
+                logger.info(f"Final P/L: {pl_percentage:.2%}")
+                logger.info(f"Initial quantity: {trade_info.get('initial_quantity')}")
+                
+                # Cleanup
+                del self.active_trades[symbol]
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error exiting full position: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
     def verify_connections(self):
         """Verify all connections are working"""
@@ -230,17 +282,17 @@ class ZeroDTEStrategy:
             logger.info("=== TRADE EXECUTION START ===")
             logger.info(f"Trade details received: {json.dumps(trade_details, indent=2)}")
             
-            # Check PDT limit first
-            from main import pdt_tracker
-            can_trade, use_next_day = pdt_tracker.can_trade()
-            if not can_trade:
-                next_date = pdt_tracker.get_next_available_trade_date()
-                logger.warning(f"Cannot execute trade: Weekly trade limit (3) reached. Next available trade date: {next_date}")
-                return False
-            
-            # Define base URLs for different API versions
-            DATA_URL = "https://data.alpaca.markets/v1beta1"  # Keep v1beta1 for market data
-            TRADING_URL = "https://api.alpaca.markets/v2"  # Changed to v2 endpoint
+            # Check PDT limit
+            try:
+                from main import pdt_tracker
+                can_trade, use_next_day = pdt_tracker.can_trade()
+                if not can_trade:
+                    next_date = pdt_tracker.get_next_available_trade_date()
+                    logger.warning(f"Cannot execute trade: Weekly trade limit (3) reached. Next available trade date: {next_date}")
+                    return False
+            except ImportError:
+                logger.warning("PDT tracker not available - continuing without trade tracking")
+                can_trade, use_next_day = True, False
             
             if not self.is_trading_hours():
                 logger.error("Cannot execute trade outside trading hours")
@@ -262,34 +314,30 @@ class ZeroDTEStrategy:
             logger.info(f"Account Status: {account.status}")
             logger.info(f"Account Buying Power: ${buying_power}")
 
-            # If no strike price provided, get the ATM strike and adjust based on direction
-            if not strike:
-                try:
-                    latest_trade = self.alpaca_api.get_latest_trade(symbol)
-                    current_price = float(latest_trade.price)
-                    # Round to nearest $1 instead of $5
-                    atm_strike = round(current_price)
-                    
-                    # For calls, go one strike below current price
-                    # For puts, go one strike above current price
-                    if direction == 'BULL':
-                        strike = atm_strike - 1  # One strike below current price
-                        logger.info(f"BULL trade: Using strike {strike} (below current price {current_price})")
-                    else:  # BEAR
-                        strike = atm_strike + 1  # One strike above current price
-                        logger.info(f"BEAR trade: Using strike {strike} (above current price {current_price})")
-                    
-                    logger.info(f"Current price: ${current_price}, ATM strike: ${atm_strike}, Selected strike: ${strike}")
-                except Exception as e:
-                    logger.error(f"Failed to get strike price: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    return False
+            # Get current price for ATM strike selection
+            try:
+                latest_trade = self.alpaca_api.get_latest_trade(symbol)
+                current_price = float(latest_trade.price)
+                # Round to nearest $1
+                atm_strike = round(current_price)
+                
+                # Select strike based on direction
+                if direction == 'BULL':
+                    strike = atm_strike - 1  # One strike below current price
+                    logger.info(f"BULL trade: Using strike {strike} (below current price {current_price})")
+                else:  # BEAR
+                    strike = atm_strike + 1  # One strike above current price
+                    logger.info(f"BEAR trade: Using strike {strike} (above current price {current_price})")
+                
+                logger.info(f"Current price: ${current_price}, ATM strike: ${atm_strike}, Selected strike: ${strike}")
+            except Exception as e:
+                logger.error(f"Failed to get strike price: {str(e)}")
+                logger.error(traceback.format_exc())
+                return False
 
             # Get expiration date based on PDT status
             today = datetime.now()
             if use_next_day:
-                # If at PDT limit, use tomorrow's date
-                # If today is Friday, use Monday
                 if today.weekday() == 4:  # Friday
                     expiration_date = (today + timedelta(days=3)).strftime('%Y-%m-%d')
                     logger.info(f"At PDT limit on Friday, using Monday expiration: {expiration_date}")
@@ -300,186 +348,124 @@ class ZeroDTEStrategy:
                 expiration_date = today.strftime('%Y-%m-%d')
                 logger.info(f"Using same day expiration: {expiration_date}")
 
-            # Get all options snapshots for the symbol
-            options_url = f"{DATA_URL}/options/snapshots/{symbol}?expiration_date={expiration_date}"
+            # Get options chain
+            options_url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{symbol}?expiration_date={expiration_date}"
             headers = {
                 'APCA-API-KEY-ID': self.alpaca_api._key_id,
                 'APCA-API-SECRET-KEY': self.alpaca_api._secret_key
             }
 
-            logger.info(f"Fetching options snapshots URL: {options_url}")
-
+            logger.info(f"Fetching options chain...")
+            
             try:
                 all_strikes = []
-                next_page_token = None
+                options_response = requests.get(options_url, headers=headers)
                 
-                while True:
-                    # Add page token if we have one
-                    url = options_url
-                    if next_page_token:
-                        url += f"?page_token={next_page_token}"
-                    
-                    options_response = requests.get(url, headers=headers)
-                    logger.info(f"Options Response Status: {options_response.status_code}")
-                    
-                    if options_response.status_code != 200:
-                        logger.error(f"Failed to get options snapshots: {options_response.text}")
-                        return False
+                if options_response.status_code != 200:
+                    logger.error(f"Failed to get options chain: {options_response.text}")
+                    return False
 
-                    options_data = options_response.json()
-                    snapshots = options_data.get('snapshots', {})
-                    
-                    for symbol, data in snapshots.items():
-                        try:
-                            # Determine if this is a call or put
-                            is_call = 'C' in symbol
-                            
-                            # Skip if option type doesn't match direction
-                            if (direction == 'BULL' and not is_call) or (direction == 'BEAR' and is_call):
-                                continue
-                            
-                            strike_price = float(symbol[-8:]) / 1000
-                            
-                            # Get quote data with validation
-                            quote = data.get('latestQuote', {})
-                            ask_price = float(quote.get('askPrice', quote.get('ap', 0)))
-                            bid_price = float(quote.get('bidPrice', quote.get('bp', 0)))
-                            
-                            # Quote validation
-                            if ask_price <= 0 or bid_price <= 0:
-                                logger.debug(f"Skipping {symbol} - Invalid quotes: Ask=${ask_price}, Bid=${bid_price}")
-                                continue
-                            
-                            if ask_price < bid_price:
-                                logger.debug(f"Skipping {symbol} - Inverted quotes: Ask=${ask_price}, Bid=${bid_price}")
-                                continue
-                            
-                            spread_percentage = (ask_price - bid_price) / ask_price
-                            if spread_percentage > 0.20:
-                                logger.debug(f"Skipping {symbol} - Wide spread: {spread_percentage:.2%}")
-                                continue
-                            
-                            # Only add if it matches our target strike
-                            if strike_price == strike:
-                                all_strikes.append({
-                                    'symbol': symbol,
-                                    'strike': strike_price,
-                                    'data': data,
-                                    'ask': ask_price,
-                                    'bid': bid_price,
-                                    'spread': spread_percentage
-                                })
-                                logger.info(f"Found matching contract: {symbol} at strike {strike_price}")
-                                break  # We found our exact strike match
-                            
-                        except ValueError as e:
-                            logger.error(f"Error parsing contract {symbol}: {e}")
-                            continue
-                    
-                    # If we found our strike, no need to continue pagination
-                    if all_strikes:
-                        break
+                options_data = options_response.json()
+                snapshots = options_data.get('snapshots', {})
+                
+                for symbol, data in snapshots.items():
+                    try:
+                        # Determine if call or put
+                        is_call = 'C' in symbol
                         
-                    next_page_token = options_data.get('next_page_token')
-                    if not next_page_token:
-                        break
+                        # Skip if option type doesn't match direction
+                        if (direction == 'BULL' and not is_call) or (direction == 'BEAR' and is_call):
+                            continue
+                        
+                        strike_price = float(symbol[-8:]) / 1000
+                        
+                        # Get quote data
+                        quote = data.get('latestQuote', {})
+                        ask_price = float(quote.get('askPrice', quote.get('ap', 0)))
+                        bid_price = float(quote.get('bidPrice', quote.get('bp', 0)))
+                        
+                        # Validate quotes
+                        if ask_price <= 0 or bid_price <= 0:
+                            continue
+                        
+                        if ask_price < bid_price:
+                            continue
+                        
+                        spread_percentage = (ask_price - bid_price) / ask_price
+                        if spread_percentage > 0.20:  # Skip if spread > 20%
+                            continue
+                        
+                        # Only add if it matches our target strike
+                        if strike_price == strike:
+                            all_strikes.append({
+                                'symbol': symbol,
+                                'strike': strike_price,
+                                'ask': ask_price,
+                                'bid': bid_price,
+                                'spread': spread_percentage
+                            })
+                            logger.info(f"Found matching contract: {symbol} at strike {strike_price}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing option {symbol}: {str(e)}")
+                        continue
 
-                # Verify we found our desired contract
                 if not all_strikes:
                     logger.error(f"No valid contracts found for strike ${strike}")
                     return False
-                    
-                # Select the contract (should only be one since we're looking for exact strike match)
-                desired_contract = all_strikes[0]
-                logger.info(f"Selected contract: {desired_contract['symbol']} at strike {desired_contract['strike']}")
-                logger.info(f"Quote details: Ask=${desired_contract['ask']}, Bid=${desired_contract['bid']}, Spread={desired_contract['spread']:.2%}")
 
-                # Additional quote validation
-                ask_price = desired_contract['ask']
-                bid_price = desired_contract['bid']
-                
-                if ask_price <= 0 or bid_price <= 0:
-                    logger.error(f"Invalid quote prices: Ask=${ask_price}, Bid=${bid_price}")
+                # Select the contract
+                contract = all_strikes[0]
+                logger.info(f"Selected contract: {contract}")
+
+                # Calculate number of contracts to buy
+                contract_price = (contract['ask'] + contract['bid']) / 2
+                min_cost = contract_price * 100
+
+                if buying_power < min_cost:
+                    logger.error(f"Insufficient buying power (${buying_power}) for minimum contract cost (${min_cost})")
                     return False
 
-                # Calculate contract details with minimum validation
-                contract_price = (ask_price + bid_price) / 2
-                min_contract_cost = contract_price * 100
+                # Use 90% of buying power, max 10 contracts
+                max_contracts = min(int((buying_power * 0.90) / min_cost), 10)
+                num_contracts = max(1, max_contracts)
 
-                if buying_power < min_contract_cost:
-                    logger.error(f"Insufficient buying power (${buying_power}) for minimum contract cost (${min_contract_cost})")
-                    return False
+                # Submit the order
+                order = self.alpaca_api.submit_order(
+                    symbol=contract['symbol'],
+                    qty=num_contracts,
+                    side='buy',
+                    type='limit',
+                    time_in_force='day',
+                    limit_price=contract['ask']
+                )
 
-                # Calculate number of contracts using 90% of buying power
-                max_safe_spending = buying_power * 0.90  # Changed from 0.75 to 0.90
-                num_contracts = int(max_safe_spending / min_contract_cost)
-                num_contracts = max(1, min(num_contracts, 10))  # Ensure at least 1 contract, cap at 10
+                logger.info(f"Order submitted: {order.id}")
 
-                logger.info(f"Contract calculations:")
-                logger.info(f"- Contract price: ${contract_price}")
-                logger.info(f"- Min contract cost: ${min_contract_cost}")
-                logger.info(f"- Max safe spending (90% of buying power): ${max_safe_spending}")
-                logger.info(f"- Raw contract calculation: {max_safe_spending / min_contract_cost}")
-                logger.info(f"- Final number of contracts: {num_contracts}")
-
-                # Submit the order with correct endpoint
-                order_url = f"{TRADING_URL}/orders"  # Updated endpoint path
-                order_data = {
-                    "symbol": desired_contract['symbol'],
-                    "qty": num_contracts,
-                    "side": "buy",
-                    "type": "limit",
-                    "time_in_force": "day",
-                    "limit_price": ask_price,
-                    "asset_class": "option"  # Added asset_class parameter
-                }
-
-                logger.info(f"Submitting order:")
-                logger.info(f"URL: {order_url}")
-                logger.info(f"Order data: {json.dumps(order_data, indent=2)}")
-
+                # Record the trade
                 try:
-                    order_response = requests.post(
-                        order_url, 
-                        headers=headers, 
-                        json=order_data
-                    )
-                    logger.info(f"Order Response Status: {order_response.status_code}")
-                    logger.info(f"Order Response Body: {order_response.text}")
-
-                    if order_response.status_code not in [200, 201]:
-                        logger.error(f"Order submission failed: {order_response.text}")
-                        return False
-
-                    order = order_response.json()
-                    logger.info(f"Order response: {json.dumps(order, indent=2)}")
-                    
-                    # Record the trade in PDT tracker
-                    trades_remaining = pdt_tracker.add_trade({
-                        'symbol': symbol,
-                        'type': 'entry',
-                        'direction': direction,
-                        'quantity': num_contracts,
-                        'price': contract_price,
-                        'strike': strike
-                    })
-                    
-                    logger.info(f"Trade recorded in PDT tracker. {trades_remaining} trades remaining this week.")
-
+                    if 'pdt_tracker' in locals():
+                        trades_remaining = pdt_tracker.add_trade({
+                            'symbol': symbol,
+                            'type': 'entry',
+                            'direction': direction,
+                            'quantity': num_contracts,
+                            'price': contract_price,
+                            'strike': strike
+                        })
+                        logger.info(f"Trade recorded in PDT tracker. {trades_remaining} trades remaining this week.")
                 except Exception as e:
-                    logger.error(f"Error submitting order: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    return False
+                    logger.warning(f"Failed to record trade in PDT tracker: {str(e)}")
 
                 # Track the trade
                 self.active_trades[symbol] = {
-                    'order_id': order['id'],
+                    'order_id': order.id,
                     'entry_time': datetime.now(),
                     'direction': direction,
                     'strike': strike,
-                    'option_symbol': desired_contract['symbol'],
+                    'option_symbol': contract['symbol'],
                     'num_contracts': num_contracts,
-                    'contract_cost': min_contract_cost,
+                    'contract_cost': min_cost,
                     'entry_price': contract_price,
                     'initial_quantity': num_contracts,
                     'current_quantity': num_contracts,
@@ -488,8 +474,7 @@ class ZeroDTEStrategy:
                     'alert_type': trade_details['alert_type']
                 }
 
-                logger.info(f"✅ Order submitted successfully: {order['id']}")
-                logger.info(f"Trade details: {num_contracts} contracts of {desired_contract['symbol']} at ${contract_price}")
+                logger.info("Trade execution completed successfully")
                 return True
 
             except Exception as e:
@@ -689,18 +674,10 @@ class ZeroDTEStrategy:
 
     def check_exit_conditions(self, position):
         """
-        Implement two different profit-taking strategies based on number of contracts:
-        
-        For positions < 4 contracts:
-        - Full exit at +10% gain or -5% loss (whichever comes first)
-        
-        For positions >= 4 contracts:
-        - 25% at 10% gain
-        - 25% at 15% gain
-        - 25% at 20% gain
-        - 25% at 25% gain
-        - Initial stop loss at -5%
-        - Additional stop loss at 5% below last profit take
+        Exit conditions:
+        1. Take profit at +10% any time
+        2. Take any profit after 45 minutes
+        3. Take loss at -5% only after 20 minutes
         """
         try:
             symbol = position.symbol
@@ -710,105 +687,41 @@ class ZeroDTEStrategy:
             logger.info(f"=== CHECKING EXIT CONDITIONS ===")
             logger.info(f"Symbol: {symbol}")
             logger.info(f"Current P/L: {current_pl:.2%}")
-            
-            # Create a JSON-safe version of trade_info for logging
-            log_info = {
-                'symbol': symbol,
-                'direction': trade_info.get('direction'),
-                'strike': trade_info.get('strike'),
-                'option_symbol': trade_info.get('option_symbol'),
-                'num_contracts': trade_info.get('num_contracts'),
-                'contract_cost': trade_info.get('contract_cost'),
-                'entry_price': trade_info.get('entry_price'),
-                'initial_quantity': trade_info.get('initial_quantity'),
-                'current_quantity': trade_info.get('current_quantity'),
-                'profit_stages_taken': trade_info.get('profit_stages_taken', []),
-                'last_profit_level': trade_info.get('last_profit_level', 0),
-                'alert_type': trade_info.get('alert_type'),
-                'entry_time': trade_info.get('entry_time').isoformat() if trade_info.get('entry_time') else None
-            }
-            
-            logger.info(f"Position Details: {json.dumps(log_info, indent=2)}")
-            
-            # Get initial position size if not stored
-            if 'initial_quantity' not in trade_info:
-                trade_info['initial_quantity'] = float(position.qty)
-                trade_info['current_quantity'] = float(position.qty)
-                trade_info['profit_stages_taken'] = []
-                trade_info['last_profit_level'] = 0
-                trade_info['first_check_time'] = datetime.now()  # Add first check time
-                logger.info("Initialized position tracking data")
-            
-            initial_quantity = trade_info['initial_quantity']
-            logger.info(f"Initial position size: {initial_quantity} contracts")
-            
-            # Different strategies based on position size
-            if initial_quantity < 4:
-                logger.info("Using small position strategy (single exit at +10% or -5%)")
-                
-                # Exit at +10% gain
-                if current_pl >= 0.10:
-                    logger.info(f"Small position +10% profit target reached at {current_pl:.2%}")
-                    return self.exit_full_position(position)
-                
-                # Wait 20 minutes before allowing a sell at -5% loss
-                time_since_first_check = datetime.now() - trade_info['first_check_time']
-                if current_pl <= -0.05 and time_since_first_check >= timedelta(minutes=20):
-                    logger.info(f"Small position -5% stop loss triggered at {current_pl:.2%} after 20 minutes")
-                    return self.exit_full_position(position)
-                    
-            else:
-                logger.info("Using large position strategy (staged profit taking)")
-                
-                # Base stop loss if no profit targets hit
-                if not trade_info['profit_stages_taken']:
-                    time_since_first_check = datetime.now() - trade_info['first_check_time']
-                    if current_pl <= -0.05 and time_since_first_check >= timedelta(minutes=20):
-                        logger.info(f"Initial stop loss triggered at {current_pl:.2%} after 20 minutes")
-                        return self.exit_full_position(position)
-                
-                # Stop loss relative to last profit take
-                last_profit_level = trade_info.get('last_profit_level', 0)
-                if trade_info['profit_stages_taken'] and current_pl < (last_profit_level - 0.05):
-                    logger.info(f"Trailing stop loss triggered. Current P/L: {current_pl:.2%}, Last profit level: {last_profit_level:.2%}")
-                    return self.exit_full_position(position)
 
-                # Define and check profit stages
-                profit_stages = [
-                    (0.10, 0.25),  # 10% profit, take 25%
-                    (0.15, 0.25),  # 15% profit, take 25%
-                    (0.20, 0.25),  # 20% profit, take 25%
-                    (0.25, 0.25)   # 25% profit, take 25%
-                ]
-                
-                logger.info("Checking profit taking stages...")
-                logger.info(f"Stages already taken: {trade_info['profit_stages_taken']}")
-                
-                for profit_target, size_to_sell in profit_stages:
-                    if profit_target not in trade_info['profit_stages_taken']:
-                        logger.info(f"Checking {profit_target:.2%} target...")
-                        
-                        if current_pl >= profit_target:
-                            logger.info(f"Profit target {profit_target:.2%} reached!")
-                            
-                            current_quantity = trade_info['current_quantity']
-                            contracts_to_sell = int(initial_quantity * size_to_sell)
-                            
-                            logger.info(f"Position details for profit taking:")
-                            logger.info(f"- Initial quantity: {initial_quantity}")
-                            logger.info(f"- Current quantity: {current_quantity}")
-                            logger.info(f"- Contracts to sell: {contracts_to_sell}")
-                            
-                            if contracts_to_sell > 0:
-                                logger.info(f"Executing profit take at {profit_target:.2%}")
-                                if self.exit_partial_position(position, contracts_to_sell):
-                                    trade_info['profit_stages_taken'].append(profit_target)
-                                    trade_info['last_profit_level'] = profit_target
-                                    trade_info['current_quantity'] -= contracts_to_sell
+            # Initialize first_check_time if not present
+            if 'first_check_time' not in trade_info:
+                trade_info['first_check_time'] = datetime.now()
+                logger.info("Initialized position tracking time")
+                return False
+
+            # Calculate time in position
+            time_in_position = datetime.now() - trade_info['first_check_time']
+            minutes_in_position = time_in_position.total_seconds() / 60
+
+            logger.info(f"Time in position: {minutes_in_position:.2f} minutes")
+
+            # Exit condition 1: Take profit at +10% any time
+            if current_pl >= 0.10:
+                logger.info(f"Taking profit at {current_pl:.2%} (≥10% target reached)")
+                return self.exit_full_position(position)
+
+            # Exit condition 2: Take any profit after 45 minutes
+            if minutes_in_position >= 45 and current_pl > 0:
+                logger.info(f"Taking profit at {current_pl:.2%} (Position held for {minutes_in_position:.2f} minutes)")
+                return self.exit_full_position(position)
+
+            # Exit condition 3: Take loss at -5% only after 20 minutes
+            if minutes_in_position >= 20 and current_pl <= -0.05:
+                logger.info(f"Taking loss at {current_pl:.2%} (Position held for {minutes_in_position:.2f} minutes)")
+                return self.exit_full_position(position)
+
+            # Log if no exit conditions met
+            logger.info("No exit conditions met, holding position")
+            return False
 
         except Exception as e:
             logger.error(f"Error checking exit conditions: {str(e)}")
-            logger.error(traceback.format_exc())  # Add full traceback for better debugging
+            logger.error(traceback.format_exc())
             return False
 
     def exit_partial_position(self, position, qty_to_sell):
@@ -830,38 +743,4 @@ class ZeroDTEStrategy:
             
         except Exception as e:
             logger.error(f"Error executing partial exit: {str(e)}")
-            return False
-
-    def exit_full_position(self, position):
-        """Exit entire remaining position"""
-        try:
-            symbol = position.symbol
-            remaining_qty = self.active_trades[symbol].get('current_quantity', position.qty)
-            logger.info(f"Exiting full position for {symbol}: {remaining_qty} contracts remaining")
-            
-            order = self.alpaca_api.submit_order(
-                symbol=symbol,
-                qty=remaining_qty,
-                side='sell',
-                type='market',
-                time_in_force='day'
-            )
-            
-            logger.info(f"Full exit order submitted: {order.id}")
-            
-            # Remove from active trades
-            if symbol in self.active_trades:
-                # Log final trade summary
-                trade_info = self.active_trades[symbol]
-                logger.info(f"Trade Summary for {symbol}:")
-                logger.info(f"Initial Quantity: {trade_info.get('initial_quantity')}")
-                logger.info(f"Profit Stages Taken: {trade_info.get('profit_stages_taken', [])}")
-                logger.info(f"Final Exit: Stop loss triggered at {float(position.unrealized_plpc):.2%}")
-                
-                del self.active_trades[symbol]
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error exiting full position: {str(e)}")
             return False
