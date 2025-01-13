@@ -41,14 +41,15 @@ class ZeroDTEStrategy:
             api_version='v2'
         )
 
-        self.symbols = ['SPY', 'QQQ', 'TSLA', 'NVDA', 'AMD', 'AAPL', 'SMCI', 'IWM', 'COIN']
+        # Update symbols list to only include the specified tickers
+        self.symbols = ['SPY', 'QQQ', 'IWM', 'TSLA', 'AAPL', 'NVDA', 'AMD', 'COIN']
         self.data = {}
         self.gmail_user = gmail_user
         self.gmail_password = gmail_password
         self.active_trades = {}
         logger.info(f"ZeroDTEStrategy initialized with symbols: {', '.join(self.symbols)}")
-        self.trade_history = []  # Add this line
-        self.completed_trades = {'won': 0, 'lost': 0}  # Add this line
+        self.trade_history = []
+        self.completed_trades = {'won': 0, 'lost': 0}
 
     def exit_full_position(self, position):
         try:
@@ -226,54 +227,77 @@ class ZeroDTEStrategy:
             logger.info(f"Alert Subject: {subject}")
             logger.info(f"Alert Body: {body}")
 
-            # Only handle WR alerts
-            if "WR" in subject:
+            # Combine subject and body for searching, case insensitive
+            full_text = (subject + " " + body).upper()
+            
+            if "WR" in full_text:
                 try:
-                    parts = subject.split(' - ')
-                    symbol = parts[1].split()[1]  # Expects format: "XX% WR - SYMBOL BULL/BEAR"
-                    direction = 'BULL' if 'BULL' in subject else 'BEAR'
+                    # Create pattern specifically for our tracked symbols
+                    symbol_pattern = r'\b(SPY|QQQ|IWM|TSLA|AAPL|NVDA|AMD|COIN)\b\s*-\s*\['
+                    symbol_match = re.search(symbol_pattern, full_text)
                     
-                    if symbol not in self.symbols:
-                        logger.error(f"Symbol {symbol} not in tracked list")
+                    if not symbol_match:
+                        logger.error("No valid symbol found in alert. Looking for: SPY, QQQ, IWM, TSLA, AAPL, NVDA, AMD, COIN")
+                        return False
+                        
+                    symbol = symbol_match.group(1)
+                    logger.info(f"Found symbol: {symbol}")
+                    
+                    # Extract direction (BULL/BEAR)
+                    direction_match = re.search(r'\[\s*\d+\s*(BULL|BEAR)', full_text)
+                    direction = direction_match.group(1) if direction_match else None
+                    
+                    if direction:
+                        logger.info(f"Found direction: {direction}")
+                    else:
+                        logger.error("Could not determine BULL/BEAR direction")
                         return False
 
-                    logger.info(f"WR Alert - Symbol: {symbol}, Direction: {direction}")
+                    # Extract strike price
+                    strike_match = re.search(r'STRIKE\s*(\d+(?:\.\d+)?)', full_text)
+                    strike_price = float(strike_match.group(1)) if strike_match else None
+                    
+                    if strike_price:
+                        logger.info(f"Found strike price: {strike_price}")
+                    else:
+                        logger.error("Could not find strike price")
+                        return False
 
-                    # Check if we have an existing position
+                    # Handle existing positions
                     if symbol in self.active_trades:
                         current_position = self.active_trades[symbol]
                         current_direction = current_position['direction']
                         
-                        logger.info(f"Found existing position for {symbol}")
-                        logger.info(f"Current position direction: {current_direction}")
-                        logger.info(f"New alert direction: {direction}")
-                        
-                        # If directions match, keep the position
                         if current_direction == direction:
-                            logger.info(f"New alert matches current position direction. Keeping position.")
+                            logger.info("New alert matches current position direction. Keeping position.")
                             return True
                         else:
-                            # Directions don't match, exit the position
-                            logger.info(f"New alert opposite to current position direction. Exiting position.")
+                            logger.info("New alert opposite to current position direction. Exiting position.")
                             positions = self.alpaca_api.list_positions()
                             for pos in positions:
                                 if pos.symbol == symbol:
                                     return self.exit_full_position(pos)
                             return False
 
-                    # No existing position, execute new trade
-                    return self.execute_trade({'symbol': symbol, 'direction': direction, 'alert_type': 'WR'})
+                    # Execute new trade
+                    return self.execute_trade({
+                        'symbol': symbol, 
+                        'direction': direction, 
+                        'alert_type': 'WR',
+                        'strike': strike_price
+                    })
 
                 except Exception as e:
-                    logger.error(f"Error parsing WR alert: {str(e)}")
-                    logger.error(traceback.format_exc())  # Added full traceback for better debugging
+                    logger.error(f"Error parsing alert: {str(e)}")
+                    logger.error(traceback.format_exc())
                     return False
             else:
                 logger.info("Ignoring non-WR alert")
                 return False
 
         except Exception as e:
-            logger.error(f"Error processing alert: {str(e)}", exc_info=True)
+            logger.error(f"Error processing alert: {str(e)}")
+            logger.error(traceback.format_exc())
             return False
 
     def execute_trade(self, trade_details):
